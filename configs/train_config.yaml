@@ -1,0 +1,56 @@
+data:
+  event_log_path: data/dat_train1.csv
+  event_definitions_path: event_definitions.csv
+  cache_enabled: true
+  cache_path: data/cache/prepared_data.pkl
+  max_len: 30  # RF baseline only; LSTM/fusion uses full variable-length journeys
+  val_split: 0.2
+  split_random_state: 42
+  time_feature_max_gap_hours: 1440
+  truncation_probability: 0.043  # scales the number of truncated samples by journey duration in days
+  success_event: order_shipped
+  inactivity_days_for_unsuccessful: 60
+  exclude_ongoing_from_training: true
+  min_truncation_days: 1
+
+model:
+  embedding_dim: 32
+  time_feature_dim: 7
+  time_embedding_dim: 8
+  summary_feature_dim: 5
+  summary_embedding_dim: 8
+  cnn_channels: 64
+  cnn_kernel_size: 3
+  hidden_size: 64
+  lstm_layers: 1
+  bidirectional: true
+  num_classes: 2
+  dropout: 0.2
+
+training:
+  epochs: 12
+  batch_size: 64
+  lr: 0.0005
+  grad_clip_norm: 1.0
+  optimizer: configs/optimizers/adam_cosine_warmup.yaml
+
+outputs:
+  log_file_path: logs/train.log
+  ongoing_predictions_path: outputs/ongoing_predictions.csv
+  decision_threshold: 0.5
+  rf_model_path: artifacts/rf_model.joblib
+  rf_training_data_path: artifacts/rf_training_data.npz
+  rf_pdp_plot_path: artifacts/rf_top_feature_pdp.png
+  rf_ice_plot_path: artifacts/rf_top_feature_ice.png
+
+rf_model:
+  n_estimators: 300
+  max_depth: null
+  min_samples_split: 2
+  min_samples_leaf: 1
+
+synthetic_data:
+  n_users: 800
+  random_state: 42
+  success_probability: 0.3
+  max_start_day_offset: 180

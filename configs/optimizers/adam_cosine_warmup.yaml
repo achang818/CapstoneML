@@ -1,0 +1,11 @@
+# Optimizer + scheduler example: Adam with linear warmup followed by cosine annealing
+optimizer:
+  type: adam
+  weight_decay: 1e-5
+
+scheduler:
+  type: cosine
+  min_lr: 1e-6
+  warmup_epochs: 1
+  # If you want a different T_max (decay length after warmup), set t_max; otherwise it's inferred as total_epochs - warmup_epochs
+  # t_max: null
