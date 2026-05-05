@@ -484,6 +484,7 @@ def create_data_loaders(
     truncation_probability: float,
     min_truncation_days: int,
     random_state: int = 42,
+    num_workers: int = 0,
 ) -> Tuple[DataLoader, DataLoader]:
     train_records, val_records = split_records_by_time(records, val_split=val_split, random_state=random_state)
 
@@ -498,12 +499,16 @@ def create_data_loaders(
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_journey_batch,
+        num_workers=int(num_workers),
+        persistent_workers=bool(int(num_workers) > 0),
     )
     val_loader = DataLoader(
         JourneyDataset(val_records, max_gap_hours=max_gap_hours),
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_journey_batch,
+        num_workers=int(num_workers),
+        persistent_workers=bool(int(num_workers) > 0),
     )
     return train_loader, val_loader
 
@@ -512,6 +517,7 @@ def create_inference_loader(
     records: Sequence[OngoingJourneyRecord],
     batch_size: int,
     max_gap_hours: float,
+    num_workers: int = 0,
 ) -> DataLoader:
     """Create DataLoader for inference on ongoing journeys.
 
@@ -528,4 +534,6 @@ def create_inference_loader(
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_ongoing_journey_batch,
+        num_workers=int(num_workers),
+        persistent_workers=bool(int(num_workers) > 0),
     )

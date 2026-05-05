@@ -3,6 +3,7 @@ data:
   event_definitions_path: event_definitions.csv
   cache_enabled: true
   cache_path: data/cache/prepared_data.pkl
+  preprocess_n_jobs: 28
   max_len: 30  # RF baseline only; LSTM/fusion uses full variable-length journeys
   val_split: 0.2
   split_random_state: 42
@@ -30,6 +31,7 @@ model:
 training:
   epochs: 12
   batch_size: 64
+  dataloader_num_workers: 12
   lr: 0.0005
   grad_clip_norm: 1.0
   optimizer: configs/optimizers/adam_cosine_warmup.yaml

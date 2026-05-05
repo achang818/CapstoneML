@@ -182,6 +182,7 @@ def main() -> None:
         success_event=str(data_cfg.get("success_event", SUCCESS_EVENT)),
         inactivity_days_for_unsuccessful=int(data_cfg["inactivity_days_for_unsuccessful"]),
         exclude_ongoing_from_training=bool(data_cfg["exclude_ongoing_from_training"]),
+        preprocess_n_jobs=int(data_cfg.get("preprocess_n_jobs", 1)),
         cache_enabled=bool(data_cfg.get("cache_enabled", True)),
         cache_path=str(data_cfg.get("cache_path", "data/cache/prepared_data.pkl")),
     )
@@ -193,6 +194,7 @@ def main() -> None:
 
     LOGGER.info("[3/6] Building train/validation data loaders and time features...")
     min_truncation_days = int(data_cfg.get("min_truncation_days", data_cfg.get("min_truncation_events", 1)))
+    dataloader_num_workers = int(train_cfg.get("dataloader_num_workers", 0))
     train_loader, val_loader = create_data_loaders(
         records=prepared.records,
         batch_size=int(train_cfg["batch_size"]),
@@ -201,6 +203,7 @@ def main() -> None:
         truncation_probability=float(data_cfg["truncation_probability"]),
         min_truncation_days=min_truncation_days,
         random_state=int(data_cfg["split_random_state"]),
+        num_workers=dataloader_num_workers,
     )
 
     # Infer the time feature dimension from the data pipeline so config stays in sync.
@@ -261,6 +264,7 @@ def main() -> None:
         records=prepared.ongoing_records,
         batch_size=int(train_cfg["batch_size"]),
         max_gap_hours=float(data_cfg["time_feature_max_gap_hours"]),
+        num_workers=dataloader_num_workers,
     )
     predict_ongoing_journeys_to_csv(
         model=model,

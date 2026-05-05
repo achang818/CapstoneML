@@ -17,6 +17,7 @@ import pickle
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
+from joblib import Parallel, delayed
 import numpy as np
 import pandas as pd
 
@@ -327,6 +328,7 @@ def build_journey_records(
     success_event: str = SUCCESS_EVENT,
     inactivity_days_for_unsuccessful: int = 60,
     exclude_ongoing_from_training: bool = True,
+    n_jobs: int = 1,
 ) -> Tuple[List[JourneyRecord], List[OngoingJourneyRecord]]:
     """Build journey records from raw event log.
     
@@ -357,20 +359,25 @@ def build_journey_records(
 
     df = df.sort_values(["user_id", "event_time"])
     latest_timestamp = df["event_time"].max()
+    df["event_name"] = df["event_name"].astype(str)
+
+    user_order = pd.unique(df["user_id"])
     grouped = df.groupby("user_id", sort=False)
+    journeys = grouped.agg({"event_name": list, "event_time": list})
+    journeys = journeys.rename(columns={"event_name": "event_names", "event_time": "event_times"})
+    journeys["last_event_time"] = grouped["event_time"].max()
+    journeys = journeys.reindex(user_order)
 
-    records: List[JourneyRecord] = []
-    ongoing_records: List[OngoingJourneyRecord] = []
     unk_id = vocab[UNK_TOKEN]
+    n_jobs = int(n_jobs)
 
-    # Process each user's journey
-    for user_id, journey in grouped:
-        journey = journey.sort_values("event_time")
-        event_names = journey["event_name"].astype(str).tolist()
-        ids = [vocab.get(name, unk_id) for name in event_names]  # Map events to vocab IDs
-        last_event_time = journey["event_time"].max()
-        
-        # Classify journey state
+    def _process_one(
+        user_id: Any,
+        event_names: List[str],
+        event_times: List[pd.Timestamp],
+        last_event_time: pd.Timestamp,
+    ) -> Tuple[JourneyRecord | None, OngoingJourneyRecord | None]:
+        ids = [vocab.get(name, unk_id) for name in event_names]
         journey_state = _label_journey(
             event_names=event_names,
             last_event_time=last_event_time,
@@ -379,31 +386,54 @@ def build_journey_records(
             inactivity_days_for_unsuccessful=inactivity_days_for_unsuccessful,
         )
 
-        # Handle ongoing journeys
         if journey_state == "ongoing":
-            ongoing_records.append(
-                OngoingJourneyRecord(
-                    user_id=user_id,
-                    event_ids=ids,
-                    event_times=journey["event_time"].tolist(),
-                    journey_end_time=last_event_time,
-                )
-            )
-            if exclude_ongoing_from_training:
-                continue
-            continue
-
-        # Handle finished journeys (successful or unsuccessful)
-        binary_label = LABEL_SUCCESSFUL if journey_state == "successful" else LABEL_UNSUCCESSFUL
-        records.append(
-            JourneyRecord(
+            ongoing = OngoingJourneyRecord(
                 user_id=user_id,
                 event_ids=ids,
-                event_times=journey["event_time"].tolist(),
-                label=binary_label,
+                event_times=event_times,
                 journey_end_time=last_event_time,
             )
+            if exclude_ongoing_from_training:
+                return None, ongoing
+            # If we include ongoing journeys in training, they still have no label;
+            # keep behavior consistent by excluding them from labeled records.
+            return None, ongoing
+
+        binary_label = LABEL_SUCCESSFUL if journey_state == "successful" else LABEL_UNSUCCESSFUL
+        finished = JourneyRecord(
+            user_id=user_id,
+            event_ids=ids,
+            event_times=event_times,
+            label=binary_label,
+            journey_end_time=last_event_time,
         )
+        return finished, None
+
+    tasks = [
+        (
+            user_id,
+            row["event_names"],
+            row["event_times"],
+            row["last_event_time"],
+        )
+        for user_id, row in journeys.iterrows()
+        if isinstance(row["event_names"], list) and isinstance(row["event_times"], list)
+    ]
+
+    if n_jobs == 1:
+        results = [_process_one(*task) for task in tasks]
+    else:
+        results = Parallel(n_jobs=n_jobs, prefer="processes")(
+            delayed(_process_one)(*task) for task in tasks
+        )
+
+    records: List[JourneyRecord] = []
+    ongoing_records: List[OngoingJourneyRecord] = []
+    for finished, ongoing in results:
+        if finished is not None:
+            records.append(finished)
+        if ongoing is not None:
+            ongoing_records.append(ongoing)
 
     if not records:
         raise ValueError(
@@ -421,6 +451,7 @@ def prepare_from_event_log(
     success_event: str = SUCCESS_EVENT,
     inactivity_days_for_unsuccessful: int = 60,
     exclude_ongoing_from_training: bool = True,
+    preprocess_n_jobs: int = 1,
     cache_enabled: bool = True,
     cache_path: str = "data/cache/prepared_data.pkl",
 ) -> PreparedData:
@@ -496,6 +527,7 @@ def prepare_from_event_log(
         success_event=success_event,
         inactivity_days_for_unsuccessful=inactivity_days_for_unsuccessful,
         exclude_ongoing_from_training=exclude_ongoing_from_training,
+        n_jobs=int(preprocess_n_jobs),
 
         # Create prepared data object
     )

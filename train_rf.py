@@ -247,6 +247,7 @@ def main() -> None:
         success_event=str(data_cfg.get("success_event", SUCCESS_EVENT)),
         inactivity_days_for_unsuccessful=int(data_cfg["inactivity_days_for_unsuccessful"]),
         exclude_ongoing_from_training=bool(data_cfg["exclude_ongoing_from_training"]),
+        preprocess_n_jobs=int(data_cfg.get("preprocess_n_jobs", 1)),
         cache_enabled=bool(data_cfg.get("cache_enabled", True)),
         cache_path=str(data_cfg.get("cache_path", "data/cache/prepared_data.pkl")),
     )
