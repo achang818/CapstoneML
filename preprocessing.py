@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 import pickle
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -423,9 +424,18 @@ def build_journey_records(
     if n_jobs == 1:
         results = [_process_one(*task) for task in tasks]
     else:
-        results = Parallel(n_jobs=n_jobs, prefer="processes")(
-            delayed(_process_one)(*task) for task in tasks
-        )
+        # NOTE: Prefer threads to avoid duplicating large Python objects across processes.
+        # With process-based parallelism, each worker needs to pickle/copy task args
+        # (lists of timestamps / event names), which can spike RAM enough to freeze machines.
+        prefer = os.environ.get("CAPSTONEML_JOBLIB_PREFER", "threads").strip().lower() or "threads"
+        if prefer not in {"threads", "processes"}:
+            prefer = "threads"
+        if prefer == "processes":
+            LOGGER.warning(
+                "Using process-based preprocessing parallelism (n_jobs=%d). This may use a lot of RAM on large logs.",
+                n_jobs,
+            )
+        results = Parallel(n_jobs=n_jobs, prefer=prefer)(delayed(_process_one)(*task) for task in tasks)
 
     records: List[JourneyRecord] = []
     ongoing_records: List[OngoingJourneyRecord] = []

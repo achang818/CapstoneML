@@ -12,7 +12,7 @@ Architecture:
 
 import torch
 import torch.nn as nn
-from torch.nn.utils.rnn import pack_sequence
+from torch.nn.utils.rnn import pack_padded_sequence, pack_sequence
 
 
 class LSTMClassifier(nn.Module):
@@ -72,19 +72,45 @@ class LSTMClassifier(nn.Module):
 
     def forward(
         self,
-        x_batch: list[torch.Tensor],
-        time_features_batch: list[torch.Tensor],
+        x_batch: list[torch.Tensor] | torch.Tensor,
+        time_features_batch: list[torch.Tensor] | torch.Tensor,
         summary_features: torch.Tensor,
+        lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Combine event embeddings and projected time features per sequence.
-        combined_sequences = []
-        for x, time_features in zip(x_batch, time_features_batch):
-            event_embeddings = self.embedding(x)
-            projected_time_features = self.time_projection(time_features)
-            combined_sequences.append(torch.cat([event_embeddings, projected_time_features], dim=-1))
+        # Fast path: padded tensors + lengths.
+        if isinstance(x_batch, torch.Tensor):
+            if not isinstance(time_features_batch, torch.Tensor):
+                raise TypeError("time_features_batch must be a Tensor when x_batch is a Tensor")
+            if lengths is None:
+                raise ValueError("lengths must be provided when using padded batch tensors")
+            if x_batch.ndim != 2:
+                raise ValueError(f"x_batch must have shape (B, L); got {tuple(x_batch.shape)}")
+            if time_features_batch.ndim != 3:
+                raise ValueError(
+                    f"time_features_batch must have shape (B, L, F); got {tuple(time_features_batch.shape)}"
+                )
 
-        # Pack sequences for LSTM (handles variable lengths efficiently).
-        packed = pack_sequence(combined_sequences, enforce_sorted=False)
+            event_embeddings = self.embedding(x_batch)
+            projected_time_features = self.time_projection(time_features_batch)
+            combined = torch.cat([event_embeddings, projected_time_features], dim=-1)
+
+            packed = pack_padded_sequence(
+                combined,
+                lengths=lengths.detach().cpu(),
+                batch_first=True,
+                enforce_sorted=False,
+            )
+        else:
+            # Backward-compatible path: list of variable-length tensors.
+            combined_sequences = []
+            for x, time_features in zip(x_batch, time_features_batch):
+                event_embeddings = self.embedding(x)
+                projected_time_features = self.time_projection(time_features)
+                combined_sequences.append(torch.cat([event_embeddings, projected_time_features], dim=-1))
+
+            # Pack sequences for LSTM (handles variable lengths efficiently).
+            packed = pack_sequence(combined_sequences, enforce_sorted=False)
+
         _, (h_n, _) = self.lstm(packed)
 
         # Extract final hidden state.

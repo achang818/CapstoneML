@@ -385,91 +385,112 @@ class JourneyDataset(Dataset):
 
 def collate_journey_batch(
     batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]]
-) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Collate variable-length journeys into padded batch tensors.
+
+    Returning a small number of large tensors (instead of a list of many tensors)
+    is much more stable with multi-process DataLoaders on Linux.
+
+    Returns:
+        x_padded: LongTensor (B, L)
+        time_padded: FloatTensor (B, L, F)
+        summary_batch: FloatTensor (B, S)
+        lengths: LongTensor (B,)
+        labels: LongTensor (B,)
+    """
+
     sequences, time_features, summary_features, lengths, labels = zip(*batch)
-    return list(sequences), list(time_features), torch.stack(summary_features), torch.stack(labels)
+
+    batch_size = len(sequences)
+    max_len = int(max(lengths)) if batch_size > 0 else 0
+    feature_dim = int(time_features[0].shape[1]) if batch_size > 0 and time_features[0].ndim == 2 else 0
+
+    x_padded = torch.zeros((batch_size, max_len), dtype=torch.long)
+    time_padded = torch.zeros((batch_size, max_len, feature_dim), dtype=torch.float32)
+    lengths_tensor = torch.as_tensor(lengths, dtype=torch.long)
+
+    for i, (seq, tf, length) in enumerate(zip(sequences, time_features, lengths)):
+        li = int(length)
+        if li <= 0:
+            continue
+        x_padded[i, :li] = seq[:li]
+        time_padded[i, :li, :] = tf[:li, :]
+
+    return x_padded, time_padded, torch.stack(summary_features), lengths_tensor, torch.stack(labels).long()
 
 
 class OngoingJourneyDataset(Dataset):
     """PyTorch Dataset for inference on unlabeled ongoing journeys.
 
-    Materializes all tensors in memory during initialization for efficient batching
-    during inference. Stores metadata (user_ids, timestamps) for prediction exports.
+    Computes tensors lazily in __getitem__ to keep memory bounded.
+    Stores metadata (user_ids, timestamps) for prediction exports.
     """
     def __init__(self, records: Sequence[OngoingJourneyRecord], max_gap_hours: float) -> None:
-        sequences: List[np.ndarray] = []
-        time_features: List[np.ndarray] = []
-        summary_features: List[np.ndarray] = []
-        lengths: List[int] = []
-        user_ids: List[str] = []
-        journey_end_times: List[str] = []
-        observed_event_counts: List[int] = []
-
-        iterator = tqdm(records, desc="Materializing ongoing tensors", unit="journey", leave=False)
-        for record in iterator:
-            sequence, features, length = build_lstm_sequence_features(
-                event_ids=record.event_ids,
-                event_times=record.event_times,
-                max_gap_hours=max_gap_hours,
-                journey_start_time=record.event_times[0],
-            )
-
-            sequences.append(sequence)
-            time_features.append(features)
-            summary_features.append(
-                build_journey_summary_features(
-                    event_ids=record.event_ids,
-                    event_times=record.event_times,
-                    max_gap_hours=max_gap_hours,
-                )
-            )
-            lengths.append(length)
-            user_ids.append(str(record.user_id))
-            journey_end_times.append(record.journey_end_time.isoformat())
-            observed_event_counts.append(len(record.event_ids))
-
-        self.x = [torch.from_numpy(sequence).long() for sequence in sequences]
-        self.time_features = [torch.from_numpy(features).float() for features in time_features]
-        self.summary_features = [torch.from_numpy(features).float() for features in summary_features]
-        self.lengths = lengths
-        self.user_ids = user_ids
-        self.journey_end_times = journey_end_times
-        self.observed_event_counts = observed_event_counts
+        self.records = list(records)
+        self.max_gap_hours = float(max_gap_hours)
 
     def __len__(self) -> int:
-        return len(self.x)
+        return len(self.records)
 
     def __getitem__(
         self, idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, str, str, int]:
+        record = self.records[idx]
+        sequence, features, length = build_lstm_sequence_features(
+            event_ids=record.event_ids,
+            event_times=record.event_times,
+            max_gap_hours=self.max_gap_hours,
+            journey_start_time=record.event_times[0],
+        )
+        summary = build_journey_summary_features(
+            event_ids=record.event_ids,
+            event_times=record.event_times,
+            max_gap_hours=self.max_gap_hours,
+        )
         return (
-            self.x[idx],
-            self.time_features[idx],
-            self.summary_features[idx],
-            self.lengths[idx],
-            self.user_ids[idx],
-            self.journey_end_times[idx],
-            self.observed_event_counts[idx],
+            torch.from_numpy(sequence).long(),
+            torch.from_numpy(features).float(),
+            torch.from_numpy(summary).float(),
+            length,
+            str(record.user_id),
+            record.journey_end_time.isoformat(),
+            len(record.event_ids),
         )
 
 
 def collate_ongoing_journey_batch(
     batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, str, str, int]]
 ) -> Tuple[
-    List[torch.Tensor],
-    List[torch.Tensor],
     torch.Tensor,
-    List[int],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
     List[str],
     List[str],
     List[int],
 ]:
     sequences, time_features, summary_features, lengths, user_ids, journey_end_times, observed_event_counts = zip(*batch)
+
+    batch_size = len(sequences)
+    max_len = int(max(lengths)) if batch_size > 0 else 0
+    feature_dim = int(time_features[0].shape[1]) if batch_size > 0 and time_features[0].ndim == 2 else 0
+
+    x_padded = torch.zeros((batch_size, max_len), dtype=torch.long)
+    time_padded = torch.zeros((batch_size, max_len, feature_dim), dtype=torch.float32)
+    lengths_tensor = torch.as_tensor(lengths, dtype=torch.long)
+
+    for i, (seq, tf, length) in enumerate(zip(sequences, time_features, lengths)):
+        li = int(length)
+        if li <= 0:
+            continue
+        x_padded[i, :li] = seq[:li]
+        time_padded[i, :li, :] = tf[:li, :]
+
     return (
-        list(sequences),
-        list(time_features),
+        x_padded,
+        time_padded,
         torch.stack(summary_features),
-        list(lengths),
+        lengths_tensor,
         list(user_ids),
         list(journey_end_times),
         list(observed_event_counts),

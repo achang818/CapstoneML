@@ -123,11 +123,12 @@ def predict_ongoing_journeys_to_csv(
             journey_end_times,
             observed_event_counts,
         ) in ongoing_loader:
-            x_batch = [x.to(device) for x in x_batch]
-            time_batch = [t.to(device) for t in time_batch]
+            x_batch = x_batch.to(device)
+            time_batch = time_batch.to(device)
             summary_batch = summary_batch.to(device)
+            lengths_batch = lengths_batch.to(device)
 
-            logits = model(x_batch, time_batch, summary_batch)
+            logits = model(x_batch, time_batch, summary_batch, lengths=lengths_batch)
             probs = torch.softmax(logits, dim=1).cpu().numpy()
 
             for i, user_id in enumerate(user_ids):
@@ -210,10 +211,10 @@ def main() -> None:
     inferred_time_feature_dim = None
     try:
         first_batch = next(iter(train_loader))
-        # Batch format: (x_batch, time_batch, summary_batch, y_batch)
-        _, time_batch, _, _ = first_batch
-        if isinstance(time_batch, list) and len(time_batch) > 0:
-            inferred_time_feature_dim = int(time_batch[0].shape[1])
+        # Batch format: (x_padded, time_padded, summary_batch, lengths, y_batch)
+        _, time_batch, _, _, _ = first_batch
+        if isinstance(time_batch, torch.Tensor) and time_batch.ndim == 3:
+            inferred_time_feature_dim = int(time_batch.shape[2])
     except Exception as exc:
         LOGGER.warning("Could not infer time_feature_dim from loader: %s", exc)
 

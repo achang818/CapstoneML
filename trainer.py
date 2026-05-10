@@ -49,13 +49,13 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict
     y_pred = []
 
     with torch.no_grad():
-        for x_batch, time_batch, summary_batch, y_batch in loader:
-            # Move batches to device
-            x_batch = [x.to(device) for x in x_batch]
-            time_batch = [t.to(device) for t in time_batch]
+        for x_batch, time_batch, summary_batch, lengths_batch, y_batch in loader:
+            x_batch = x_batch.to(device)
+            time_batch = time_batch.to(device)
             summary_batch = summary_batch.to(device)
-            # Get model predictions (argmax of logits)
-            logits = model(x_batch, time_batch, summary_batch)
+            lengths_batch = lengths_batch.to(device)
+
+            logits = model(x_batch, time_batch, summary_batch, lengths=lengths_batch)
             preds = torch.argmax(logits, dim=1).cpu().numpy()
             y_pred.extend(preds.tolist())
             y_true.extend(y_batch.cpu().numpy().tolist())
@@ -130,17 +130,17 @@ def fit(
             # Training batches with progress bar
 
             progress = tqdm(train_loader, desc=f"Epoch {epoch:02d}/{config.epochs:02d}", unit="batch")
-            for x_batch, time_batch, summary_batch, y_batch in progress:
-                # Move batches to device
-                x_batch = [x.to(device) for x in x_batch]
-                time_batch = [t.to(device) for t in time_batch]
+            for x_batch, time_batch, summary_batch, lengths_batch, y_batch in progress:
+                x_batch = x_batch.to(device)
+                time_batch = time_batch.to(device)
                 summary_batch = summary_batch.to(device)
+                lengths_batch = lengths_batch.to(device)
                 y_batch = y_batch.to(device)
 
                 # Forward pass
 
                 optimizer.zero_grad()
-                logits = model(x_batch, time_batch, summary_batch)
+                logits = model(x_batch, time_batch, summary_batch, lengths=lengths_batch)
                 loss = criterion(logits, y_batch)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
