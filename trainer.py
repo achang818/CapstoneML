@@ -164,3 +164,115 @@ def fit(
         LOGGER.warning("Training interrupted by user. Saving current model state and continuing to prediction export.")
 
     return interrupted
+
+
+def evaluate_transformer(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> Dict[str, float]:
+    """Evaluate a transformer model on padded batches."""
+
+    model.eval()
+    y_true = []
+    y_pred = []
+
+    with torch.no_grad():
+        for x, time_features, src_key_padding_mask, y_batch in loader:
+            x = x.to(device)
+            time_features = time_features.to(device)
+            src_key_padding_mask = src_key_padding_mask.to(device)
+
+            logits = model(x, time_features, src_key_padding_mask)
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            y_pred.extend(preds.tolist())
+            y_true.extend(y_batch.cpu().numpy().tolist())
+
+    y_true_arr = np.array(y_true, dtype=np.int64)
+    y_pred_arr = np.array(y_pred, dtype=np.int64)
+    return {"accuracy": float(accuracy_score(y_true_arr, y_pred_arr))}
+
+
+def fit_transformer(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    config: TrainConfig,
+    optimizer_cfg: Optional[Dict] = None,
+) -> bool:
+    """Fit transformer model parameters; returns True if interrupted (Ctrl+C)."""
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    criterion = nn.CrossEntropyLoss()
+
+    weight_decay = 0.0
+    if optimizer_cfg and isinstance(optimizer_cfg, dict):
+        opt_block = optimizer_cfg.get("optimizer") or optimizer_cfg
+        weight_decay = float(opt_block.get("weight_decay", 0.0)) if isinstance(opt_block, dict) else 0.0
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=weight_decay)
+
+    warmup_scheduler = None
+    main_scheduler = None
+    warmup_epochs = 0
+    if optimizer_cfg and isinstance(optimizer_cfg, dict):
+        sched_block = optimizer_cfg.get("scheduler", {})
+        if isinstance(sched_block, dict):
+            sched_type = sched_block.get("type")
+            warmup_epochs = int(sched_block.get("warmup_epochs", 0))
+            min_lr = float(sched_block.get("min_lr", 1e-6))
+            if sched_type == "cosine":
+                t_max = sched_block.get("t_max")
+                if t_max is None:
+                    t_max = max(1, config.epochs - warmup_epochs)
+                else:
+                    t_max = int(t_max)
+                main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=min_lr)
+
+            if warmup_epochs > 0:
+                warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    optimizer,
+                    lr_lambda=lambda e: float(e + 1) / float(max(1, warmup_epochs)),
+                )
+
+    interrupted = False
+    try:
+        for epoch in range(1, config.epochs + 1):
+            model.train()
+            total_loss = 0.0
+            if epoch == 1:
+                LOGGER.info("Epoch 01 warmup: first batches may be slower while kernels initialize.")
+
+            progress = tqdm(train_loader, desc=f"Epoch {epoch:02d}/{config.epochs:02d}", unit="batch")
+            for x, time_features, src_key_padding_mask, y_batch in progress:
+                x = x.to(device)
+                time_features = time_features.to(device)
+                src_key_padding_mask = src_key_padding_mask.to(device)
+                y_batch = y_batch.to(device)
+
+                optimizer.zero_grad()
+                logits = model(x, time_features, src_key_padding_mask)
+                loss = criterion(logits, y_batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+                optimizer.step()
+
+                total_loss += float(loss.item())
+                progress.set_postfix(loss=f"{loss.item():.4f}")
+
+            avg_loss = total_loss / max(1, len(train_loader))
+            metrics = evaluate_transformer(model, val_loader, device)
+            LOGGER.info("Epoch %02d | loss=%.4f | val_acc=%.4f", epoch, avg_loss, metrics["accuracy"])
+
+            if warmup_scheduler is not None and epoch <= warmup_epochs:
+                warmup_scheduler.step()
+            elif main_scheduler is not None:
+                main_scheduler.step()
+
+    except KeyboardInterrupt:
+        interrupted = True
+        LOGGER.warning("Training interrupted by user. Saving current model state and continuing to prediction export.")
+
+    return interrupted

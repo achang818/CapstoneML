@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torch.nn.utils.rnn import pad_sequence
 from tqdm.auto import tqdm
 
 from preprocessing import JourneyRecord, OngoingJourneyRecord, truncate_journey_by_time
@@ -555,6 +556,244 @@ def create_inference_loader(
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_ongoing_journey_batch,
+        num_workers=int(num_workers),
+        persistent_workers=bool(int(num_workers) > 0),
+    )
+
+
+# ==================== Transformer-friendly loaders (no summary stats) ====================
+
+
+class JourneyDatasetNoSummary(Dataset):
+    """Dataset that returns per-step sequences + time features (no summary stats).
+
+    Intended for Transformer models that use padded batching.
+    """
+
+    def __init__(
+        self,
+        records: Sequence[JourneyRecord],
+        max_gap_hours: float,
+        truncation_probability: float = 0.0,
+        min_truncation_days: int = 1,
+        random_state: int = 42,
+    ) -> None:
+        self.records = list(records)
+        self.max_gap_hours = float(max_gap_hours)
+        self.truncation_probability = float(truncation_probability)
+        self.min_truncation_days = int(min_truncation_days)
+        self.random_state = int(random_state)
+
+        # Mirror the lazy augmentation indexing logic from JourneyDataset.
+        self._sample_counts: List[int] = []
+        self._cumulative_counts: List[int] = []
+        running_total = 0
+        for record in self.records:
+            num_samples = 1
+            if self.truncation_probability > 0.0 and len(record.event_times) > 1:
+                journey_duration_days = max(
+                    1,
+                    int(
+                        np.ceil(
+                            (record.event_times[-1] - record.event_times[0]).total_seconds()
+                            / 86400.0
+                        )
+                    ),
+                )
+                num_samples += max(1, int(np.ceil(self.truncation_probability * journey_duration_days)))
+            self._sample_counts.append(num_samples)
+            running_total += num_samples
+            self._cumulative_counts.append(running_total)
+
+    def __len__(self) -> int:
+        return self._cumulative_counts[-1] if self._cumulative_counts else 0
+
+    def _resolve_index(self, idx: int) -> Tuple[int, int]:
+        record_idx = bisect_right(self._cumulative_counts, idx)
+        previous_total = self._cumulative_counts[record_idx - 1] if record_idx > 0 else 0
+        sample_offset = idx - previous_total
+        return record_idx, sample_offset
+
+    def _select_record(self, record_idx: int, sample_offset: int) -> JourneyRecord:
+        record = self.records[record_idx]
+        if sample_offset == 0 or self.truncation_probability <= 0.0 or len(record.event_ids) <= 1:
+            return record
+
+        seed = np.uint32((self.random_state * 1_000_003 + record_idx * 97 + sample_offset) % (2**32))
+        rng = np.random.default_rng(seed)
+        return truncate_journey_by_time(
+            record=record,
+            rng=rng,
+            min_keep_events=self.min_truncation_days,
+        )
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+        record_idx, sample_offset = self._resolve_index(idx)
+        record = self._select_record(record_idx, sample_offset)
+        sequence, features, length = build_lstm_sequence_features(
+            event_ids=record.event_ids,
+            event_times=record.event_times,
+            max_gap_hours=self.max_gap_hours,
+            journey_start_time=record.event_times[0],
+        )
+        return (
+            torch.from_numpy(sequence).long(),
+            torch.from_numpy(features).float(),
+            int(length),
+            torch.tensor(record.label, dtype=torch.long),
+        )
+
+
+def collate_journey_transformer_batch(
+    batch: List[Tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad variable-length sequences and create a padding mask.
+
+    Returns:
+        x: LongTensor (B, L)
+        time_features: FloatTensor (B, L, F)
+        src_key_padding_mask: BoolTensor (B, L) True for PAD positions
+        labels: LongTensor (B,)
+    """
+    sequences, time_features, lengths, labels = zip(*batch)
+    x = pad_sequence(list(sequences), batch_first=True, padding_value=0)
+    t = pad_sequence(list(time_features), batch_first=True, padding_value=0.0)
+    lengths_t = torch.tensor(list(lengths), dtype=torch.long)
+    # mask: True where position >= length
+    max_len = x.shape[1]
+    positions = torch.arange(max_len, dtype=torch.long).unsqueeze(0)
+    src_key_padding_mask = positions >= lengths_t.unsqueeze(1)
+    y = torch.stack(labels).long()
+    return x, t, src_key_padding_mask, y
+
+
+class OngoingJourneyDatasetNoSummary(Dataset):
+    """Inference dataset for ongoing journeys (no summary stats)."""
+
+    def __init__(self, records: Sequence[OngoingJourneyRecord], max_gap_hours: float) -> None:
+        sequences: List[np.ndarray] = []
+        time_features: List[np.ndarray] = []
+        lengths: List[int] = []
+        user_ids: List[str] = []
+        journey_end_times: List[str] = []
+        observed_event_counts: List[int] = []
+
+        iterator = tqdm(records, desc="Materializing ongoing tensors", unit="journey", leave=False)
+        for record in iterator:
+            sequence, features, length = build_lstm_sequence_features(
+                event_ids=record.event_ids,
+                event_times=record.event_times,
+                max_gap_hours=max_gap_hours,
+                journey_start_time=record.event_times[0],
+            )
+
+            sequences.append(sequence)
+            time_features.append(features)
+            lengths.append(int(length))
+            user_ids.append(str(record.user_id))
+            journey_end_times.append(record.journey_end_time.isoformat())
+            observed_event_counts.append(len(record.event_ids))
+
+        self.x = [torch.from_numpy(sequence).long() for sequence in sequences]
+        self.time_features = [torch.from_numpy(features).float() for features in time_features]
+        self.lengths = lengths
+        self.user_ids = user_ids
+        self.journey_end_times = journey_end_times
+        self.observed_event_counts = observed_event_counts
+
+    def __len__(self) -> int:
+        return len(self.x)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int, str, str, int]:
+        return (
+            self.x[idx],
+            self.time_features[idx],
+            self.lengths[idx],
+            self.user_ids[idx],
+            self.journey_end_times[idx],
+            self.observed_event_counts[idx],
+        )
+
+
+def collate_ongoing_journey_transformer_batch(
+    batch: List[Tuple[torch.Tensor, torch.Tensor, int, str, str, int]]
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    List[int],
+    List[str],
+    List[str],
+    List[int],
+]:
+    sequences, time_features, lengths, user_ids, journey_end_times, observed_event_counts = zip(*batch)
+    x = pad_sequence(list(sequences), batch_first=True, padding_value=0)
+    t = pad_sequence(list(time_features), batch_first=True, padding_value=0.0)
+    lengths_t = torch.tensor(list(lengths), dtype=torch.long)
+    max_len = x.shape[1]
+    positions = torch.arange(max_len, dtype=torch.long).unsqueeze(0)
+    src_key_padding_mask = positions >= lengths_t.unsqueeze(1)
+    return (
+        x,
+        t,
+        src_key_padding_mask,
+        list(lengths),
+        list(user_ids),
+        list(journey_end_times),
+        list(observed_event_counts),
+    )
+
+
+def create_data_loaders_transformer(
+    records: Sequence[JourneyRecord],
+    batch_size: int,
+    val_split: float,
+    max_gap_hours: float,
+    truncation_probability: float,
+    min_truncation_days: int,
+    random_state: int = 42,
+    num_workers: int = 0,
+) -> Tuple[DataLoader, DataLoader]:
+    train_records, val_records = split_records_by_time(records, val_split=val_split, random_state=random_state)
+
+    train_loader = DataLoader(
+        JourneyDatasetNoSummary(
+            train_records,
+            max_gap_hours=max_gap_hours,
+            truncation_probability=truncation_probability,
+            min_truncation_days=min_truncation_days,
+            random_state=random_state,
+        ),
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_journey_transformer_batch,
+        num_workers=int(num_workers),
+        persistent_workers=bool(int(num_workers) > 0),
+    )
+
+    val_loader = DataLoader(
+        JourneyDatasetNoSummary(val_records, max_gap_hours=max_gap_hours),
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_journey_transformer_batch,
+        num_workers=int(num_workers),
+        persistent_workers=bool(int(num_workers) > 0),
+    )
+
+    return train_loader, val_loader
+
+
+def create_inference_loader_transformer(
+    records: Sequence[OngoingJourneyRecord],
+    batch_size: int,
+    max_gap_hours: float,
+    num_workers: int = 0,
+) -> DataLoader:
+    return DataLoader(
+        OngoingJourneyDatasetNoSummary(records, max_gap_hours=max_gap_hours),
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_ongoing_journey_transformer_batch,
         num_workers=int(num_workers),
         persistent_workers=bool(int(num_workers) > 0),
     )

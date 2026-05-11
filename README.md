@@ -81,6 +81,16 @@ Edit the YAML, then run:
 python train.py --config configs/train_config.yaml
 ```
 
+## Counterfactual "catalog_mail" at truncation
+
+To do a simple what-if / counterfactual check for promotions, you can enable:
+
+- `data.counterfactual_catalog_mail_at_truncation: true`
+
+When enabled, inference for ongoing journeys appends a synthetic `catalog_mail` event exactly at the truncation point (the last observed timestamp for that journey) and predicts from that modified history.
+
+This is useful for comparing predicted success probabilities with and without a promotion event at “now”, using the same observed journey prefix.
+
 Both `train.py` and `train_rf.py` write console output and log files through the shared logging setup.
 
 `train_rf.py` additionally saves:

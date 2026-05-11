@@ -18,11 +18,24 @@ from sklearn.model_selection import StratifiedKFold, cross_val_score
 
 from data_loader import build_time_features, split_records_by_time
 from pipeline_logging import setup_logging
-from preprocessing import SUCCESS_EVENT, JourneyRecord, prepare_from_event_log
+from preprocessing import CATALOG_MAIL_EVENT, SUCCESS_EVENT, JourneyRecord, inject_catalog_mail_at_truncation, prepare_from_event_log
 from train import generate_synthetic_event_log
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _configure_torch_multiprocessing() -> None:
+    """Best-effort guard for PyTorch multiprocessing issues.
+
+    Keeps behavior consistent with train.py even if torch is imported indirectly.
+    """
+    try:
+        import torch.multiprocessing as mp
+
+        mp.set_sharing_strategy("file_system")
+    except Exception:
+        return
 
 
 def load_yaml_config(path: Path) -> Dict[str, Any]:
@@ -216,6 +229,8 @@ def _predict_ongoing_journeys(
 def main() -> None:
     started_at = time.perf_counter()
 
+    _configure_torch_multiprocessing()
+
     args = parse_args()
     config_path = Path(args.config)
     config = load_yaml_config(config_path)
@@ -295,9 +310,23 @@ def main() -> None:
     )
 
     output_path = Path(output_cfg.get("ongoing_predictions_path", "outputs/ongoing_predictions.csv"))
+
+    ongoing_records = prepared.ongoing_records
+    if bool(data_cfg.get("counterfactual_catalog_mail_at_truncation", False)):
+        catalog_mail_event_id = prepared.vocab.get(CATALOG_MAIL_EVENT)
+        if catalog_mail_event_id is None:
+            raise ValueError(
+                f"counterfactual_catalog_mail_at_truncation is enabled, but '{CATALOG_MAIL_EVENT}' is not present "
+                "in event_definitions.csv (so it has no vocab ID)."
+            )
+        ongoing_records = inject_catalog_mail_at_truncation(
+            records=ongoing_records,
+            catalog_mail_event_id=int(catalog_mail_event_id),
+        )
+
     _predict_ongoing_journeys(
         model=model,
-        ongoing_records=prepared.ongoing_records,
+        ongoing_records=ongoing_records,
         max_len=int(data_cfg["max_len"]),
         max_gap_hours=float(data_cfg["time_feature_max_gap_hours"]),
         output_path=output_path,

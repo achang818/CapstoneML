@@ -26,11 +26,29 @@ import yaml
 from data_loader import create_data_loaders, create_inference_loader
 from pipeline_logging import setup_logging
 from model import LSTMClassifier
-from preprocessing import SUCCESS_EVENT, prepare_from_event_log
+from preprocessing import CATALOG_MAIL_EVENT, SUCCESS_EVENT, inject_catalog_mail_at_truncation, prepare_from_event_log
 from trainer import TrainConfig, fit
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _configure_torch_multiprocessing() -> None:
+    """Apply safe defaults for PyTorch multiprocessing.
+
+    This prevents a class of Linux/WSL DataLoader failures like:
+    "RuntimeError: received 0 items of ancdata".
+    """
+    try:
+        import torch.multiprocessing as mp
+
+        # The default "file_descriptor" strategy can fail on some systems
+        # (notably WSL / constrained environments). "file_system" is slower
+        # but more robust.
+        mp.set_sharing_strategy("file_system")
+    except Exception:
+        # Best-effort only; do not block training if unsupported.
+        return
 
 
 def generate_synthetic_event_log(
@@ -149,6 +167,8 @@ def predict_ongoing_journeys_to_csv(
 def main() -> None:
     started_at = time.perf_counter()
 
+    _configure_torch_multiprocessing()
+
     args = parse_args()
     config_path = Path(args.config)
     config = load_yaml_config(config_path)
@@ -261,8 +281,21 @@ def main() -> None:
         LOGGER.info("[6/6] Training was stopped manually; exporting current ongoing predictions...")
     else:
         LOGGER.info("[6/6] Running inference for ongoing journeys and writing predictions...")
+    ongoing_records = prepared.ongoing_records
+    if bool(data_cfg.get("counterfactual_catalog_mail_at_truncation", False)):
+        catalog_mail_event_id = prepared.vocab.get(CATALOG_MAIL_EVENT)
+        if catalog_mail_event_id is None:
+            raise ValueError(
+                f"counterfactual_catalog_mail_at_truncation is enabled, but '{CATALOG_MAIL_EVENT}' is not present "
+                "in event_definitions.csv (so it has no vocab ID)."
+            )
+        ongoing_records = inject_catalog_mail_at_truncation(
+            records=ongoing_records,
+            catalog_mail_event_id=int(catalog_mail_event_id),
+        )
+
     ongoing_loader = create_inference_loader(
-        records=prepared.ongoing_records,
+        records=ongoing_records,
         batch_size=int(train_cfg["batch_size"]),
         max_gap_hours=float(data_cfg["time_feature_max_gap_hours"]),
         num_workers=dataloader_num_workers,

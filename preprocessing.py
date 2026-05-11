@@ -16,7 +16,7 @@ import logging
 import os
 import pickle
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 from joblib import Parallel, delayed
 import numpy as np
@@ -31,6 +31,7 @@ UNK_TOKEN = "<UNK>"
 
 # Events and labels
 SUCCESS_EVENT = "order_shipped"
+CATALOG_MAIL_EVENT = "catalog_mail"
 LABEL_UNSUCCESSFUL = 0
 LABEL_SUCCESSFUL = 1
 
@@ -92,6 +93,52 @@ class PreparedData:
 def get_label_mapping() -> Dict[int, str]:
     """Return human-readable labels for binary classification."""
     return {LABEL_UNSUCCESSFUL: "unsuccessful", LABEL_SUCCESSFUL: "successful"}
+
+
+def inject_catalog_mail_at_truncation(
+    records: Sequence[OngoingJourneyRecord],
+    catalog_mail_event_id: int,
+) -> List[OngoingJourneyRecord]:
+    """Return ongoing records with a counterfactual catalog_mail event injected.
+
+    The injected event is appended with timestamp exactly equal to each record's
+    truncation point (the last observed timestamp, i.e. journey_end_time).
+
+    This is intended for counterfactual inference: compare predictions on the
+    same observed prefix with and without a promotion event at "now".
+
+    Notes:
+        - If a record already ends with catalog_mail, it is left unchanged.
+        - journey_end_time is not moved (the injected event is at that instant).
+    """
+    injected: List[OngoingJourneyRecord] = []
+    event_id_int = int(catalog_mail_event_id)
+
+    for record in records:
+        if not record.event_ids or not record.event_times:
+            injected.append(record)
+            continue
+
+        if int(record.event_ids[-1]) == event_id_int:
+            injected.append(record)
+            continue
+
+        trunc_time = record.journey_end_time
+        new_event_ids = list(record.event_ids)
+        new_event_times = list(record.event_times)
+        new_event_ids.append(event_id_int)
+        new_event_times.append(trunc_time)
+
+        injected.append(
+            OngoingJourneyRecord(
+                user_id=record.user_id,
+                event_ids=new_event_ids,
+                event_times=new_event_times,
+                journey_end_time=record.journey_end_time,
+            )
+        )
+
+    return injected
 
 
 def load_event_definitions(path: str) -> pd.DataFrame:
